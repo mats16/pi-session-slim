@@ -1,0 +1,46 @@
+{
+  "name": "@mats16/pi-session-zstd",
+  "version": "0.1.0",
+  "description": "Compress old pi sessions with zstd and restore them transparently when they are opened.",
+  "type": "module",
+  "exports": "./index.ts",
+  "license": "MIT",
+  "author": "mats16",
+  "homepage": "https://github.com/mats16/pi-session-zstd#readme",
+  "bugs": "https://github.com/mats16/pi-session-zstd/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mats16/pi-session-zstd.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "pi-extension",
+    "sessions",
+    "zstd",
+    "compression"
+  ],
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
