@@ -1,7 +1,7 @@
 {
-  "name": "@mats16/pi-session-zstd",
+  "name": "@mats16/pi-session-slim",
   "version": "0.1.0",
-  "description": "Compress old pi sessions with zstd and restore them transparently when they are opened.",
+  "description": "Keep pi session files small: store tool images as WebP, compress old sessions with zstd, and restore them transparently when they are opened.",
   "type": "module",
   "exports": "./index.ts",
   "license": "MIT",
@@ -19,10 +19,12 @@
     "pi-extension",
     "sessions",
     "zstd",
+    "webp",
     "compression"
   ],
   "files": [
     "index.ts",
+    "webp.mjs",
     "README.md",
     "LICENSE"
   ],
@@ -42,5 +44,9 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "@jsquash/png": "^3.1.1",
+    "@jsquash/webp": "^1.5.0"
   }
 }
