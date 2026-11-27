@@ -236,11 +236,12 @@ export async function archive(file: string, quality = 0, stats?: { imageErrors: 
 				// Lines convert concurrently so every worker is busy, and are written in their order.
 				// The bytes held back are capped, so a slow image cannot pull the whole file into memory.
 				async function* (source) {
-					const queue: { line: string; slim: Promise<string> }[] = [];
+					const queue: ({ line: string; slim: Promise<string> } | undefined)[] = [];
 					let head = 0;
 					let held = 0;
 					async function next() {
-						const { line, slim } = queue[head++];
+						const { line, slim } = queue[head]!;
+						queue[head++] = undefined; // release payloads independently of index compaction
 						// Move entries only after consuming half, for amortized constant-time dequeue.
 						if (head * 2 >= queue.length) {
 							queue.splice(0, head);

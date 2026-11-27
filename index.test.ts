@@ -178,12 +178,14 @@ test("status reports missing stubs and offers recovery without assuming deletion
 	}
 });
 
-test("archive preserves many short entries across queue compaction and backpressure", async () => {
+test("archive preserves mixed-size entries across queue compaction and backpressure", async () => {
 	const { dir, file, body } = session();
 	try {
-		const text = body[0] + "\n" + Array.from({ length: 120_000 }, (_, i) =>
+		const entries = Array.from({ length: 120_000 }, (_, i) =>
 			line({ type: "message", id: String(i), message: { role: "user", content: `entry ${i}` } }),
-		).join("\n") + "\n";
+		);
+		for (let i = 100; i < entries.length; i += 20_000) entries[i] = msg(`large-${i}`, null, "user", "x".repeat(2_000_000));
+		const text = body[0] + "\n" + entries.join("\n") + "\n";
 		writeFileSync(file, text);
 		await archive(file, 80);
 		await restore(file);
