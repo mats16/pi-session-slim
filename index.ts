@@ -1,5 +1,9 @@
 /**
- * pi-session-zstd: compress old pi sessions with zstd and bring them back when they are opened.
+ * pi-session-slim: keep pi's session files small.
+ *
+ * 1. PNG images that tools return become lossy WebP before pi stores them or sends them to a model.
+ * 2. Sessions idle for a week are compressed with zstd (their remaining PNGs become WebP first)
+ *    and brought back when they are opened.
  *
  * An archived session is two files:
  *   <name>.jsonl.zst  the full session, zstd
@@ -11,6 +15,7 @@
  */
 import { createHash } from "node:crypto";
 import {
+	appendFileSync,
 	closeSync,
 	createReadStream,
 	createWriteStream,
@@ -24,23 +29,109 @@ import {
 	statSync,
 	utimesSync,
 	writeFileSync,
-	appendFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { pipeline } from "node:stream/promises";
+import { Worker } from "node:worker_threads";
 import * as zlib from "node:zlib";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const STUB_LINE_MAX = 16 * 1024; // longer lines (pasted images) stay out of the stub
 const MIN_SIZE = 64 * 1024; // smaller files save nothing once the stub is written
-const TMP = /\.jsonl(\.zst)?\.\d+\.tmp$/;
-
+const MIN_IMAGE = 4096; // base64 characters; icons this small gain nothing
+const TMP = /\.jsonl(\.zst|\.slim)?\.\d+\.tmp$/;
 export const zstOf = (file: string) => `${file}.zst`;
 export const isArchived = (file: string) => existsSync(zstOf(file));
 
 const lines = (file: string) => createInterface({ input: createReadStream(file, "utf8"), crlfDelay: Infinity });
+
+/** Only pi message images belong to us; custom entries and nested extension payloads are opaque. */
+function imageMessage(line: string) {
+	if (!line.includes('"image/')) return;
+	let entry: any;
+	try {
+		entry = JSON.parse(line);
+	} catch {
+		return;
+	}
+	if (entry?.type !== "message" || !["user", "assistant", "toolResult"].includes(entry.message?.role)) return;
+	if (!Array.isArray(entry.message.content)) return;
+	// Re-serializing must preserve every non-image byte, including opaque data and number spelling.
+	if (JSON.stringify(entry) !== line) return;
+	const images = entry.message.content.filter((block: any) =>
+		block?.type === "image" && typeof block.data === "string" &&
+		(block.mimeType === "image/png" || block.mimeType === "image/webp"),
+	);
+	return { entry, images };
+}
+
+/** The line without recognized message image bytes; opaque data still participates in equality. */
+function skeleton(line: string) {
+	const message = imageMessage(line);
+	if (!message || message.images.length === 0) return line;
+	for (const image of message.images) {
+		image.data = "";
+		image.mimeType = "image";
+	}
+	return JSON.stringify(message.entry);
+}
+
+let worker: Worker | undefined;
+let nextId = 0;
+const waiting = new Map<number, { resolve: (data: string) => void; reject: (error: Error) => void }>();
+
+/** base64 PNG to base64 WebP, in a worker thread (see webp.mjs). */
+export function toWebp(data: string, quality: number): Promise<string> {
+	if (!worker) {
+		worker = new Worker(new URL("./webp.mjs", import.meta.url));
+		const settle = (id: number) => {
+			const entry = waiting.get(id);
+			waiting.delete(id);
+			if (waiting.size === 0) worker?.unref(); // an idle worker must not keep pi alive
+			return entry;
+		};
+		worker.on("message", ({ id, data, error }) => {
+			const entry = settle(id);
+			if (error) entry?.reject(new Error(error));
+			else entry?.resolve(data);
+		});
+		worker.on("error", (error) => {
+			for (const id of [...waiting.keys()]) settle(id)?.reject(error);
+			worker = undefined;
+		});
+	}
+	const w = worker;
+	return new Promise((resolve, reject) => {
+		waiting.set(nextId, { resolve, reject });
+		w.ref();
+		w.postMessage({ id: nextId++, data, quality });
+	});
+}
+
+/** The WebP for a PNG, or undefined when it should stay as it is (tiny, unreadable, or no smaller as WebP). */
+async function smaller(png: string, quality: number): Promise<string | undefined> {
+	if (png.length < MIN_IMAGE) return undefined;
+	const webp = await toWebp(png, quality).catch(() => undefined);
+	return webp && webp.length < png.length ? webp : undefined;
+}
+
+/** A session line with its PNG images as WebP. Every other byte stays. */
+async function slimLine(line: string, quality: number): Promise<string> {
+	const message = imageMessage(line);
+	if (!message) return line;
+	let changed = false;
+	for (const image of message.images) {
+		if (image.mimeType !== "image/png") continue;
+		const webp = await smaller(image.data, quality);
+		if (!webp) continue;
+		image.data = webp;
+		image.mimeType = "image/webp";
+		changed = true;
+	}
+	return changed ? JSON.stringify(message.entry) : line;
+}
 
 /**
  * The lines pi needs to list the session: header, first user message, last message, latest name.
@@ -88,33 +179,66 @@ async function sha256(source: AsyncIterable<Buffer>) {
 	return hash.digest("hex");
 }
 
-/** Compress `file` to `file.zst` and leave a stub. Returns the bytes saved (0 when already archived). */
-export async function archive(file: string): Promise<number> {
+async function skeletonHash(file: string) {
+	const hash = createHash("sha256");
+	for await (const line of lines(file)) hash.update(`${skeleton(line)}\n`);
+	return hash.digest("hex");
+}
+
+/**
+ * Compress `file` to `file.zst` and leave a stub. With `quality` above 0, PNG images become WebP
+ * of that quality first, which cannot be undone. Returns the bytes saved (0 when already archived).
+ */
+export async function archive(file: string, quality = 0): Promise<number> {
 	const zst = zstOf(file);
 	if (existsSync(zst)) return 0;
 	const before = statSync(file);
 	const tmp = `${zst}.${process.pid}.tmp`;
 	const stubTmp = `${file}.${process.pid}.tmp`;
+	const slimTmp = `${file}.slim.${process.pid}.tmp`;
 	try {
+		let source = file;
+		if (quality > 0) {
+			let changed = false;
+			await pipeline(
+				lines(file),
+				async function* (source) {
+					for await (const line of source) {
+						const slim = await slimLine(line, quality);
+						changed ||= slim !== line;
+						yield `${slim}\n`;
+					}
+				},
+				createWriteStream(slimTmp, { mode: 0o600 }),
+			);
+			if (changed) {
+				// The images are lossy now, so the bytes cannot match. Everything else must.
+				if ((await skeletonHash(file)) !== (await skeletonHash(slimTmp))) {
+					throw new Error("WebP conversion changed more than the images");
+				}
+				source = slimTmp;
+			}
+		}
+
 		const compress = zlib.createZstdCompress({
 			params: {
 				[zlib.constants.ZSTD_c_compressionLevel]: 9, // 19 is 30x slower for under 1% on real sessions
-				// A 128 MB window finds the same image read twice in one session. 27 is the most
-				// a default decoder (`zstd -d`, node) accepts.
+				// Long-range matching over 128 MB, the largest window a default decoder
+				// (`zstd -d`, node) accepts. Sessions repeat prompts and tool output far apart.
 				[zlib.constants.ZSTD_c_enableLongDistanceMatching]: 1,
 				[zlib.constants.ZSTD_c_windowLog]: 27,
 			},
 		});
-		await pipeline(createReadStream(file), compress, createWriteStream(tmp, { mode: 0o600 }));
+		await pipeline(createReadStream(source), compress, createWriteStream(tmp, { mode: 0o600 }));
 
 		// The original is deleted below, so prove the archive gives it back first.
 		const [original, roundTrip] = await Promise.all([
-			sha256(createReadStream(file)),
+			sha256(createReadStream(source)),
 			pipeline(createReadStream(tmp), zlib.createZstdDecompress(), sha256),
 		]);
 		if (original !== roundTrip) throw new Error("archive does not match the session");
 
-		const stub = await buildStub(file);
+		const stub = await buildStub(source);
 		const now = statSync(file);
 		if (now.size !== before.size || now.mtimeMs !== before.mtimeMs) throw new Error("session changed while archiving");
 		// shortcut: a line pi appends between this check and the rename below is lost. Candidates
@@ -125,8 +249,7 @@ export async function archive(file: string): Promise<number> {
 		renameSync(stubTmp, file);
 		return before.size - statSync(zst).size - Buffer.byteLength(stub);
 	} finally {
-		rmSync(tmp, { force: true });
-		rmSync(stubTmp, { force: true });
+		for (const f of [tmp, stubTmp, slimTmp]) rmSync(f, { force: true });
 	}
 }
 
@@ -139,11 +262,13 @@ export async function restore(file: string): Promise<boolean> {
 		const mode = existsSync(file) ? statSync(file).mode & 0o777 : 0o600;
 		await pipeline(createReadStream(zst), zlib.createZstdDecompress(), createWriteStream(tmp, { mode }));
 
-		// Keep what was written to the .jsonl after it was archived.
-		const extra = new Set<string>();
-		if (existsSync(file)) for await (const line of lines(file)) if (line) extra.add(line);
+		// Keep what was written to the .jsonl after it was archived. Lines are matched without their
+		// image bytes: after a crash between archive()'s two renames the .jsonl still holds the PNGs
+		// that the archive holds as WebP, and those are the same lines.
+		const extra = new Map<string, string>();
+		if (existsSync(file)) for await (const line of lines(file)) if (line) extra.set(skeleton(line), line);
 		for await (const line of lines(tmp)) {
-			extra.delete(line);
+			extra.delete(skeleton(line));
 			if (extra.size === 0) break;
 		}
 		if (extra.size > 0) {
@@ -155,7 +280,7 @@ export async function restore(file: string): Promise<boolean> {
 			} finally {
 				closeSync(fd);
 			}
-			appendFileSync(tmp, (size > 0 && tail[0] !== 10 ? "\n" : "") + [...extra].join("\n") + "\n");
+			appendFileSync(tmp, (size > 0 && tail[0] !== 10 ? "\n" : "") + [...extra.values()].join("\n") + "\n");
 		}
 		renameSync(tmp, file);
 		rmSync(zst, { force: true });
@@ -190,7 +315,7 @@ export interface RunResult {
 export async function archiveOld(
 	roots: string[],
 	days: number,
-	opts: { skip?: string; signal?: AbortSignal; onFile?: () => void } = {},
+	opts: { skip?: string; quality?: number; signal?: AbortSignal; onFile?: () => void } = {},
 ): Promise<RunResult> {
 	const cutoff = Date.now() - days * 86_400_000;
 	const result: RunResult = { files: 0, saved: 0, errors: [] };
@@ -204,7 +329,7 @@ export async function archiveOld(
 			}
 			if (!file.endsWith(".jsonl") || file === opts.skip || st.size < MIN_SIZE || st.mtimeMs > cutoff) continue;
 			if (isArchived(file)) continue;
-			result.saved += await archive(file);
+			result.saved += await archive(file, opts.quality);
 			result.files++;
 			opts.onFile?.();
 		} catch (error) {
@@ -230,16 +355,18 @@ export async function restoreAll(roots: string[]): Promise<RunResult> {
 
 const mb = (bytes: number) => `${(bytes / 1e6).toFixed(1)} MB`;
 
-export default function sessionZstd(pi: ExtensionAPI) {
+export default function sessionSlim(pi: ExtensionAPI) {
 	if (typeof zlib.createZstdCompress !== "function") {
-		pi.on("session_start", (_e, ctx) => ctx.ui.notify("pi-session-zstd needs Node 22.15 or later; doing nothing.", "warning"));
+		pi.on("session_start", (_e, ctx) => ctx.ui.notify("pi-session-slim needs Node 22.19 or later; doing nothing.", "warning"));
 		return;
 	}
 
 	const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-	const lock = join(agentDir, "session-zstd.lock");
-	const done = join(agentDir, "session-zstd.done");
-	const envDays = Number(process.env.PI_SESSION_ZSTD_DAYS ?? 7); // 0 or not a number: no automatic run
+	const lock = join(agentDir, "session-slim.lock");
+	const done = join(agentDir, "session-slim.done");
+	const envDays = Number(process.env.PI_SESSION_SLIM_DAYS ?? process.env.PI_SESSION_ZSTD_DAYS ?? 7); // 0 or not a number: no automatic run
+	const envQuality = Number(process.env.PI_SESSION_SLIM_WEBP ?? 80);
+	const quality = envQuality > 0 && envQuality <= 100 ? envQuality : 0; // 0: images stay as they are
 	const roots = (ctx: { sessionManager: { getSessionDir(): string } }) => [
 		join(agentDir, "sessions"),
 		ctx.sessionManager.getSessionDir(), // --session-dir, PI_CODING_AGENT_SESSION_DIR, settings
@@ -269,6 +396,7 @@ export default function sessionZstd(pi: ExtensionAPI) {
 		try {
 			const result = await archiveOld(roots(ctx), days, {
 				skip,
+				quality,
 				signal: abort.signal,
 				onFile: () => utimesSync(lock, new Date(), new Date()),
 			});
@@ -277,6 +405,25 @@ export default function sessionZstd(pi: ExtensionAPI) {
 		} finally {
 			rmSync(lock, { force: true });
 		}
+	}
+
+	// Images enter a session here, so this is where they are cheapest to shrink: the session file
+	// and every later request carry the WebP, and the prompt cache never sees the PNG.
+	if (quality > 0) {
+		pi.on("tool_result", async (event) => {
+			let changed = false;
+			const content = await Promise.all(
+				event.content.map(async (block) => {
+					if (block.type !== "image" || block.mimeType !== "image/png") return block;
+					const data = await smaller(block.data, quality);
+					if (!data) return block;
+					changed = true;
+					return { ...block, data, mimeType: "image/webp" };
+				}),
+			);
+			// pi drops structuredContent when content is replaced without it.
+			if (changed) return { content, structuredContent: event.structuredContent };
+		});
 	}
 
 	pi.on("session_start", async (event, ctx) => {
@@ -288,7 +435,7 @@ export default function sessionZstd(pi: ExtensionAPI) {
 		if (file && isArchived(file)) {
 			await new Promise<void>((done) => {
 				reloaded = done;
-				pi.sendUserMessage("/session-zstd reload", { expandPromptTemplates: true });
+				pi.sendUserMessage("/session-slim reload", { expandPromptTemplates: true });
 				setTimeout(done, 60_000).unref(); // the command never ran: go on rather than hang pi
 			});
 		}
@@ -307,7 +454,7 @@ export default function sessionZstd(pi: ExtensionAPI) {
 			await restore(resolve(event.targetSessionFile));
 		} catch (error) {
 			// Opening the stub would continue a conversation without its history.
-			ctx.ui.notify(`pi-session-zstd: could not restore the session: ${(error as Error).message}`, "error");
+			ctx.ui.notify(`pi-session-slim: could not restore the session: ${(error as Error).message}`, "error");
 			return { cancel: true };
 		}
 	});
@@ -317,7 +464,7 @@ export default function sessionZstd(pi: ExtensionAPI) {
 		abort?.abort(); // stops after the file in progress
 	});
 
-	pi.registerCommand("session-zstd", {
+	pi.registerCommand("session-slim", {
 		description: "Compress old sessions with zstd: status | run [days] | restore",
 		handler: async (args, ctx) => {
 			const [sub, arg] = (args.trim() || "status").split(/\s+/);
@@ -338,13 +485,13 @@ export default function sessionZstd(pi: ExtensionAPI) {
 				);
 			if (sub === "run") {
 				const days = arg === undefined ? envDays || 7 : Number(arg);
-				if (!(days >= 0)) return ctx.ui.notify("Usage: /session-zstd run [days]", "error");
+				if (!(days >= 0)) return ctx.ui.notify("Usage: /session-slim run [days]", "error");
 				const result = await run(ctx, days, current);
 				if (!result) return ctx.ui.notify("Another pi is archiving sessions right now.", "warning");
 				return report("Archived", result);
 			}
 			if (sub === "restore") return report("Restored", await restoreAll(roots(ctx)));
-			if (sub !== "status") return ctx.ui.notify("Usage: /session-zstd [status | run [days] | restore]", "error");
+			if (sub !== "status") return ctx.ui.notify("Usage: /session-slim [status | run [days] | restore]", "error");
 			let archived = 0;
 			let archivedBytes = 0;
 			let plain = 0;
@@ -361,7 +508,8 @@ export default function sessionZstd(pi: ExtensionAPI) {
 			ctx.ui.notify(
 				`Archived: ${archived} session(s), ${mb(archivedBytes)} on disk\n` +
 					`Not archived: ${plain} session(s), ${mb(plainBytes)}\n` +
-					(envDays > 0 ? `Sessions idle for ${envDays} day(s) are archived automatically.` : "Automatic archiving is off."),
+					(envDays > 0 ? `Sessions idle for ${envDays} day(s) are archived automatically.` : "Automatic archiving is off.") +
+					`\n${quality > 0 ? `PNG images become WebP (quality ${quality}).` : "Images are kept as they are."}`,
 				"info",
 			);
 		},
