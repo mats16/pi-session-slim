@@ -55,7 +55,7 @@ Restoring writes the full session back and deletes the `.zst`. Lines that are in
 
 | Command | What it does |
 |---|---|
-| `/session-slim` | Show how many sessions are archived and their size, archives whose session was deleted, and PNGs that could not be converted since pi started |
+| `/session-slim` | Show how many sessions are archived and their size, archives with missing stubs, and PNGs that could not be converted since pi started |
 | `/session-slim run [days]` | Archive now. `days` defaults to the automatic setting; `0` archives everything but the open session |
 | `/session-slim restore` | Restore every archived session (do this before you uninstall). Converted images stay WebP |
 
@@ -84,7 +84,7 @@ Text compresses to about 0.13 of its size. Base64 images compress only to about 
 - **Other tools see the stub.** Anything that reads `.jsonl` files itself (usage reports, search scripts) sees a few lines for an archived session. Read the archive with `zstd -dc <name>.jsonl.zst`.
 - **`/resume` search** matches only the first and last message of an archived session, and its message count shows 1 or 2.
 - **`pi --fork <archived session>`** copies the stub. Open the session once, or run `/session-slim restore`, before you fork it from the command line. `/fork` inside a session is fine.
-- **Deleting an archived session** in `/resume` removes the stub; delete the `.jsonl.zst` next to it yourself. `/session-slim` counts these leftover archives.
+- **A missing stub** leaves the `.jsonl.zst` archive recoverable with `/session-slim restore`. `/session-slim` counts these archives. Deleting an archived session in `/resume` removes only its stub; remove the `.jsonl.zst` yourself only if you have confirmed you no longer want the session.
 - **A session another pi process still has open** can be archived if it has been idle for the full period. What that process writes later goes to the stub and is merged back on restore, but until then that process works from the history it has in memory.
 - Text that mentions the format (`Read image file [image/png]`) is not rewritten when the image is.
 - Age is the file's modification time.

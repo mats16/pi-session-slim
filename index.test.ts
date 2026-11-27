@@ -154,10 +154,10 @@ test("archiveOld counts PNGs it cannot convert, keeps them, and keeps line order
 	assert.equal(readFileSync(file, "utf8"), after.join("\n") + "\n");
 });
 
-test("status lists archives whose session was deleted", async () => {
+test("status reports missing stubs and offers recovery without assuming deletion", async () => {
 	const saved = process.env.PI_CODING_AGENT_DIR;
 	try {
-		const { dir, file } = session();
+		const { dir, file, text } = session();
 		process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "slim-status-"));
 		await archive(file);
 		rmSync(file); // what deleting it in /resume does
@@ -165,11 +165,31 @@ test("status lists archives whose session was deleted", async () => {
 		const notices: string[] = [];
 		sessionSlim({ on() {}, registerCommand(_name: string, command: any) { handler = command.handler; } } as any);
 		await handler("status", { sessionManager: { getSessionFile() {}, getSessionDir() { return dir; } }, ui: { notify(text: string) { notices.push(text); } } });
-		assert.match(notices[0], /Archives without a session: 1,/);
+		assert.match(notices[0], /Archives without a stub: 1,/);
+		assert.match(notices[0], /recover with \/session-slim restore/);
+		assert.doesNotMatch(notices[0], /deleted in \/resume|remove the/);
 		assert.ok(existsSync(zstOf(file))); // reported, not removed
+		await handler("restore", { sessionManager: { getSessionFile() {}, getSessionDir() { return dir; } }, ui: { notify(text: string) { notices.push(text); } } });
+		assert.equal(readFileSync(file, "utf8"), text);
+		assert.ok(!existsSync(zstOf(file)));
 	} finally {
 		if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = saved;
+	}
+});
+
+test("archive preserves many short entries across queue compaction and backpressure", async () => {
+	const { dir, file, body } = session();
+	try {
+		const text = body[0] + "\n" + Array.from({ length: 120_000 }, (_, i) =>
+			line({ type: "message", id: String(i), message: { role: "user", content: `entry ${i}` } }),
+		).join("\n") + "\n";
+		writeFileSync(file, text);
+		await archive(file, 80);
+		await restore(file);
+		assert.equal(readFileSync(file, "utf8"), text);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
 	}
 });
 

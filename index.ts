@@ -237,9 +237,15 @@ export async function archive(file: string, quality = 0, stats?: { imageErrors: 
 				// The bytes held back are capped, so a slow image cannot pull the whole file into memory.
 				async function* (source) {
 					const queue: { line: string; slim: Promise<string> }[] = [];
+					let head = 0;
 					let held = 0;
 					async function next() {
-						const { line, slim } = queue.shift()!;
+						const { line, slim } = queue[head++];
+						// Move entries only after consuming half, for amortized constant-time dequeue.
+						if (head * 2 >= queue.length) {
+							queue.splice(0, head);
+							head = 0;
+						}
 						held -= line.length;
 						const out = await slim;
 						changed ||= out !== line;
@@ -250,7 +256,7 @@ export async function archive(file: string, quality = 0, stats?: { imageErrors: 
 						held += line.length;
 						while (held > QUEUE_BYTES) yield await next();
 					}
-					while (queue.length) yield await next();
+					while (head < queue.length) yield await next();
 				},
 				createWriteStream(slimTmp, { mode: 0o600 }),
 			);
@@ -554,8 +560,7 @@ export default function sessionSlim(pi: ExtensionAPI) {
 				if (file.endsWith(".jsonl.zst")) {
 					archived++;
 					archivedBytes += statSync(file).size;
-					// Left behind when the session was deleted in /resume. Never removed for you: the stub
-					// may have been deleted by mistake, and the archive is then the only copy.
+					// A missing stub may be accidental; the archive is still recoverable.
 					if (!existsSync(file.slice(0, -4))) {
 						orphans++;
 						orphanBytes += statSync(file).size;
@@ -568,7 +573,7 @@ export default function sessionSlim(pi: ExtensionAPI) {
 			ctx.ui.notify(
 				`Archived: ${archived} session(s), ${mb(archivedBytes)} on disk\n` +
 					`Not archived: ${plain} session(s), ${mb(plainBytes)}\n` +
-					(orphans ? `Archives without a session: ${orphans}, ${mb(orphanBytes)} (deleted in /resume; remove the .jsonl.zst yourself)\n` : "") +
+					(orphans ? `Archives without a stub: ${orphans}, ${mb(orphanBytes)} (recover with /session-slim restore)\n` : "") +
 					(envDays > 0 ? `Sessions idle for ${envDays} day(s) are archived automatically.` : "Automatic archiving is off.") +
 					`\n${quality > 0 ? `PNG images become WebP (quality ${quality}).` : "Images are kept as they are."}` +
 					(imageFailures ? `\n${imageFailures} PNG image(s) could not be converted since pi started and were kept as PNG.` : ""),
