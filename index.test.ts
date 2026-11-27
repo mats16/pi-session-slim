@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { crc32, deflateSync } from "node:zlib";
-import { archive, archiveOld, isArchived, restore, restoreAll, toWebp, zstOf } from "./index.ts";
+import sessionSlim, { archive, archiveOld, isArchived, restore, restoreAll, toWebp, zstOf } from "./index.ts";
 
 const line = (o: unknown) => JSON.stringify(o);
 const msg = (id: string, parentId: string | null, role: string, text: string) =>
@@ -155,4 +155,54 @@ test("conversion output errors reject without crashing pi or replacing the origi
 	await archive(file, 80);
 	await restore(file);
 	assert.equal(readFileSync(file, "utf8"), text);
+});
+
+
+test("archive and recovery preserve opaque PNG payloads outside message images", async () => {
+	const { file, body } = session();
+	const data = png();
+	const webp = await toWebp(data, 80);
+	const opaque = { data, mimeType: "image/png" };
+	const custom = line({ type: "custom", id: "custom", customType: "example", data: opaque });
+	const changedCustom = line({ type: "custom", id: "custom", customType: "example", data: { data: webp, mimeType: "image/webp" } });
+	const message = (data: string, mimeType: string) => line({
+		type: "message", id: "image", parentId: "a5",
+		message: { role: "toolResult", content: [
+			{ type: "image", data, mimeType, metadata: opaque },
+			{ type: "text", text: "keep", metadata: opaque },
+		], details: opaque, structuredContent: opaque },
+	});
+	const call = line({ type: "message", id: "call", message: { role: "assistant", content: [{ type: "toolCall", arguments: opaque }] } });
+	const formatted = " " + message(data, "image/png");
+	const before = [...body, custom, message(data, "image/png"), call, formatted].join("\n") + "\n";
+	const after = [...body, custom, message(webp, "image/webp"), call, formatted].join("\n") + "\n";
+	writeFileSync(file, before);
+	await archive(file, 80);
+	// Recover the old full PNG file plus an opaque update, as after an interrupted archive.
+	writeFileSync(file, before + changedCustom + "\n");
+	await restore(file);
+	assert.equal(readFileSync(file, "utf8"), after + changedCustom + "\n");
+});
+
+test("renamed archive setting preserves legacy values and explicit new overrides", async () => {
+	const keys = ["PI_CODING_AGENT_DIR", "PI_SESSION_ZSTD_DAYS", "PI_SESSION_SLIM_DAYS"];
+	const saved = keys.map((key) => process.env[key]);
+	try {
+		process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "slim-settings-"));
+		for (const [legacy, current, expected] of [
+			["0", undefined, 0], ["3", undefined, 3], ["0", "2", 2], ["3", "0", 0], [undefined, undefined, 7],
+		] as const) {
+			for (const [key, value] of [["PI_SESSION_ZSTD_DAYS", legacy], ["PI_SESSION_SLIM_DAYS", current]]) {
+				if (value === undefined) delete process.env[key!];
+				else process.env[key!] = value;
+			}
+			let handler: any;
+			const notices: string[] = [];
+			sessionSlim({ on() {}, registerCommand(_name: string, command: any) { handler = command.handler; } } as any);
+			await handler("status", { sessionManager: { getSessionFile() {}, getSessionDir() { return process.env.PI_CODING_AGENT_DIR; } }, ui: { notify(text: string) { notices.push(text); } } });
+			assert.ok(notices[0].includes(expected === 0 ? "Automatic archiving is off." : `Sessions idle for ${expected} day(s)`), `${legacy}/${current}: ${notices[0]}`);
+		}
+	} finally {
+		keys.forEach((key, i) => { if (saved[i] === undefined) delete process.env[key]; else process.env[key] = saved[i]; });
+	}
 });

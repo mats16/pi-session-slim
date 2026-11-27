@@ -40,7 +40,7 @@ pi lists only `.jsonl` files, so the stub keeps the session in `/resume` with it
 
 **When.** Five seconds after pi starts, the extension archives every session under `~/.pi/agent/sessions/` (and the current session directory, if it is elsewhere) that has not been modified for 7 days and is at least 64 KB. It skips the session you have open. One pi process archives at a time, and a full pass runs at most every 6 hours.
 
-**Images in old sessions.** PNGs already in a session are converted to WebP before it is compressed, unless `PI_SESSION_SLIM_WEBP=0`. The first pass over a large backlog is slow: about 0.13 s per image.
+**Images in old sessions.** PNG image blocks in user, assistant and tool-result messages are converted to WebP before compression, unless `PI_SESSION_SLIM_WEBP=0`. Custom entries and opaque extension data are kept unchanged. Lines whose JSON formatting differs from pi’s serialization are also kept unchanged. The first pass over a large backlog is slow: about 0.13 s per image.
 
 **Checks before the original is replaced.** The archive is decompressed and its SHA-256 compared with what was compressed. When images were converted, the session with its image bytes removed must be identical before and after, and every WebP must decode to the PNG's width and height.
 
@@ -65,6 +65,8 @@ Restoring writes the full session back and deletes the `.zst`. Lines that are in
 |---|---|---|
 | `PI_SESSION_SLIM_WEBP` | `80` | WebP quality, 1 to 100. `0` keeps images as they are, in tool results and in archives |
 | `PI_SESSION_SLIM_DAYS` | `7` | Archive sessions idle for this many days. `0` turns automatic archiving off; the command and restoring still work |
+
+If `PI_SESSION_SLIM_DAYS` is unset, the legacy `PI_SESSION_ZSTD_DAYS` value is used, including `0` to keep automatic archiving off. The new variable takes precedence when both are set.
 
 ## What to expect
 

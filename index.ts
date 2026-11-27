@@ -42,18 +42,41 @@ const STUB_LINE_MAX = 16 * 1024; // longer lines (pasted images) stay out of the
 const MIN_SIZE = 64 * 1024; // smaller files save nothing once the stub is written
 const MIN_IMAGE = 4096; // base64 characters; icons this small gain nothing
 const TMP = /\.jsonl(\.zst|\.slim)?\.\d+\.tmp$/;
-// How pi serializes an image block. Only PNG is converted; WebP is matched so that skeleton() can
-// compare a session before and after conversion.
-const IMAGE = /"data":"([A-Za-z0-9+/=]+)","mimeType":"image\/(png|webp)"/g;
-
 export const zstOf = (file: string) => `${file}.zst`;
 export const isArchived = (file: string) => existsSync(zstOf(file));
 
 const lines = (file: string) => createInterface({ input: createReadStream(file, "utf8"), crlfDelay: Infinity });
 
-/** The line without its image bytes: equal before and after WebP conversion, different for any other change. */
-const skeleton = (line: string) =>
-	line.includes('"mimeType":"image/') ? line.replace(IMAGE, '"data":"","mimeType":"image"') : line;
+/** Only pi message images belong to us; custom entries and nested extension payloads are opaque. */
+function imageMessage(line: string) {
+	if (!line.includes('"image/')) return;
+	let entry: any;
+	try {
+		entry = JSON.parse(line);
+	} catch {
+		return;
+	}
+	if (entry?.type !== "message" || !["user", "assistant", "toolResult"].includes(entry.message?.role)) return;
+	if (!Array.isArray(entry.message.content)) return;
+	// Re-serializing must preserve every non-image byte, including opaque data and number spelling.
+	if (JSON.stringify(entry) !== line) return;
+	const images = entry.message.content.filter((block: any) =>
+		block?.type === "image" && typeof block.data === "string" &&
+		(block.mimeType === "image/png" || block.mimeType === "image/webp"),
+	);
+	return { entry, images };
+}
+
+/** The line without recognized message image bytes; opaque data still participates in equality. */
+function skeleton(line: string) {
+	const message = imageMessage(line);
+	if (!message || message.images.length === 0) return line;
+	for (const image of message.images) {
+		image.data = "";
+		image.mimeType = "image";
+	}
+	return JSON.stringify(message.entry);
+}
 
 let worker: Worker | undefined;
 let nextId = 0;
@@ -96,16 +119,18 @@ async function smaller(png: string, quality: number): Promise<string | undefined
 
 /** A session line with its PNG images as WebP. Every other byte stays. */
 async function slimLine(line: string, quality: number): Promise<string> {
-	if (!line.includes('"mimeType":"image/png"')) return line;
-	const parts: string[] = [];
-	let at = 0;
-	for (const m of line.matchAll(IMAGE)) {
-		const webp = m[2] === "png" ? await smaller(m[1], quality) : undefined;
+	const message = imageMessage(line);
+	if (!message) return line;
+	let changed = false;
+	for (const image of message.images) {
+		if (image.mimeType !== "image/png") continue;
+		const webp = await smaller(image.data, quality);
 		if (!webp) continue;
-		parts.push(line.slice(at, m.index), `"data":"${webp}","mimeType":"image/webp"`);
-		at = m.index + m[0].length;
+		image.data = webp;
+		image.mimeType = "image/webp";
+		changed = true;
 	}
-	return parts.join("") + line.slice(at);
+	return changed ? JSON.stringify(message.entry) : line;
 }
 
 /**
@@ -339,7 +364,7 @@ export default function sessionSlim(pi: ExtensionAPI) {
 	const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 	const lock = join(agentDir, "session-slim.lock");
 	const done = join(agentDir, "session-slim.done");
-	const envDays = Number(process.env.PI_SESSION_SLIM_DAYS ?? 7); // 0 or not a number: no automatic run
+	const envDays = Number(process.env.PI_SESSION_SLIM_DAYS ?? process.env.PI_SESSION_ZSTD_DAYS ?? 7); // 0 or not a number: no automatic run
 	const envQuality = Number(process.env.PI_SESSION_SLIM_WEBP ?? 80);
 	const quality = envQuality > 0 && envQuality <= 100 ? envQuality : 0; // 0: images stay as they are
 	const roots = (ctx: { sessionManager: { getSessionDir(): string } }) => [
