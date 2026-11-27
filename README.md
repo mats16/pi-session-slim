@@ -38,9 +38,9 @@ An archived session is two files:
 
 pi lists only `.jsonl` files, so the stub keeps the session in `/resume` with its name, first message and date. Its modification time is the original's.
 
-**When.** Five seconds after pi starts, the extension archives every session under `~/.pi/agent/sessions/` (and the current session directory, if it is elsewhere) that has not been modified for 7 days and is at least 64 KB. It skips the session you have open. One pi process archives at a time, and a full pass runs at most every 6 hours.
+**When.** Five seconds after pi starts, the extension archives every session under `~/.pi/agent/sessions/` (and the current session directory, if it is elsewhere) that has not been modified for 7 days and is at least 64 KB. It skips the session you have open. One pi process archives at a time, and a full pass runs at most every 6 hours. When a pass archives something or hits an error, pi shows a notice with the count, the space saved, and any PNGs that could not be converted (those stay PNG).
 
-**Images in old sessions.** PNG image blocks in user, assistant and tool-result messages are converted to WebP before compression, unless `PI_SESSION_SLIM_WEBP=0`. Custom entries and opaque extension data are kept unchanged. Lines whose JSON formatting differs from pi’s serialization are also kept unchanged. The first pass over a large backlog is slow: about 0.13 s per image.
+**Images in old sessions.** PNG image blocks in user, assistant and tool-result messages are converted to WebP before compression, unless `PI_SESSION_SLIM_WEBP=0`. Custom entries and opaque extension data are kept unchanged. Lines whose JSON formatting differs from pi’s serialization are also kept unchanged. Images convert in up to four worker threads (one CPU core is left for pi). The first pass over a large backlog is still slow: about 0.04 s per image on an Apple M-series machine. Workers idle for a minute exit and give their memory back.
 
 **Checks before the original is replaced.** The archive is decompressed and its SHA-256 compared with what was compressed. When images were converted, the session with its image bytes removed must be identical before and after, and every WebP must decode to the PNG's width and height.
 
@@ -55,7 +55,7 @@ Restoring writes the full session back and deletes the `.zst`. Lines that are in
 
 | Command | What it does |
 |---|---|
-| `/session-slim` | Show how many sessions are archived and their size |
+| `/session-slim` | Show how many sessions are archived and their size, archives whose session was deleted, and PNGs that could not be converted since pi started |
 | `/session-slim run [days]` | Archive now. `days` defaults to the automatic setting; `0` archives everything but the open session |
 | `/session-slim restore` | Restore every archived session (do this before you uninstall). Converted images stay WebP |
 
@@ -75,7 +75,7 @@ Measured on one real 103 MB session with 145 PNG screenshots (Apple M-series):
 | | Archive size | Time to archive | Time to restore | Size after restore |
 |---|---:|---:|---:|---:|
 | zstd only (`PI_SESSION_SLIM_WEBP=0`) | 59 MB | 1.2 s | 0.4 s | 103 MB |
-| WebP, then zstd | 23 MB | 18 s | 0.2 s | 51 MB |
+| WebP, then zstd | 23 MB | 6 s | 0.2 s | 51 MB |
 
 Text compresses to about 0.13 of its size. Base64 images compress only to about 0.6 with zstd, which is why converting them matters; a PNG slide becomes about 0.27 of its size as WebP.
 
@@ -84,7 +84,7 @@ Text compresses to about 0.13 of its size. Base64 images compress only to about 
 - **Other tools see the stub.** Anything that reads `.jsonl` files itself (usage reports, search scripts) sees a few lines for an archived session. Read the archive with `zstd -dc <name>.jsonl.zst`.
 - **`/resume` search** matches only the first and last message of an archived session, and its message count shows 1 or 2.
 - **`pi --fork <archived session>`** copies the stub. Open the session once, or run `/session-slim restore`, before you fork it from the command line. `/fork` inside a session is fine.
-- **Deleting an archived session** in `/resume` removes the stub; delete the `.jsonl.zst` next to it yourself.
+- **Deleting an archived session** in `/resume` removes the stub; delete the `.jsonl.zst` next to it yourself. `/session-slim` counts these leftover archives.
 - **A session another pi process still has open** can be archived if it has been idle for the full period. What that process writes later goes to the stub and is merged back on restore, but until then that process works from the history it has in memory.
 - Text that mentions the format (`Read image file [image/png]`) is not rewritten when the image is.
 - Age is the file's modification time.

@@ -30,17 +30,18 @@ import {
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { availableParallelism, homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { pipeline } from "node:stream/promises";
 import { Worker } from "node:worker_threads";
 import * as zlib from "node:zlib";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const STUB_LINE_MAX = 16 * 1024; // longer lines (pasted images) stay out of the stub
 const MIN_SIZE = 64 * 1024; // smaller files save nothing once the stub is written
 const MIN_IMAGE = 4096; // base64 characters; icons this small gain nothing
+const QUEUE_BYTES = 8e6; // lines waiting on WebP conversion during an archive; more was not faster
 const TMP = /\.jsonl(\.zst|\.slim)?\.\d+\.tmp$/;
 export const zstOf = (file: string) => `${file}.zst`;
 export const isArchived = (file: string) => existsSync(zstOf(file));
@@ -78,53 +79,83 @@ function skeleton(line: string) {
 	return JSON.stringify(message.entry);
 }
 
-let worker: Worker | undefined;
+// One core stays free for pi itself.
+const POOL = Math.max(1, Math.min(4, availableParallelism() - 1));
+const pool: (Worker | undefined)[] = [];
+const pending: number[] = []; // jobs in flight per worker
+const idle: (NodeJS.Timeout | undefined)[] = [];
 let nextId = 0;
-const waiting = new Map<number, { resolve: (data: string) => void; reject: (error: Error) => void }>();
+const waiting = new Map<number, { resolve: (data: string) => void; reject: (error: Error) => void; slot: number }>();
 
-/** base64 PNG to base64 WebP, in a worker thread (see webp.mjs). */
+function workerAt(slot: number): Worker {
+	const existing = pool[slot];
+	if (existing) return existing;
+	const w = new Worker(new URL("./webp.mjs", import.meta.url));
+	const settle = (id: number) => {
+		const entry = waiting.get(id);
+		waiting.delete(id);
+		if (entry && --pending[slot] === 0) {
+			w.unref(); // an idle worker must not keep pi alive
+			// Each worker holds its own codec memory, which it never shrinks: give it back once idle.
+			idle[slot] = setTimeout(() => {
+				if (pool[slot] !== w || pending[slot] !== 0) return;
+				pool[slot] = undefined;
+				void w.terminate();
+			}, 60_000).unref();
+		}
+		return entry;
+	};
+	w.on("message", ({ id, data, error }) => {
+		const entry = settle(id);
+		if (error) entry?.reject(new Error(error));
+		else entry?.resolve(data);
+	});
+	w.on("error", (error) => {
+		const failure = error instanceof Error ? error : new Error(String(error));
+		for (const [id, entry] of waiting) if (entry.slot === slot) settle(id)?.reject(failure);
+		pool[slot] = undefined;
+	});
+	pool[slot] = w;
+	pending[slot] = 0;
+	return w;
+}
+
+/** base64 PNG to base64 WebP, in the least busy of up to POOL worker threads (see webp.mjs). */
 export function toWebp(data: string, quality: number): Promise<string> {
-	if (!worker) {
-		worker = new Worker(new URL("./webp.mjs", import.meta.url));
-		const settle = (id: number) => {
-			const entry = waiting.get(id);
-			waiting.delete(id);
-			if (waiting.size === 0) worker?.unref(); // an idle worker must not keep pi alive
-			return entry;
-		};
-		worker.on("message", ({ id, data, error }) => {
-			const entry = settle(id);
-			if (error) entry?.reject(new Error(error));
-			else entry?.resolve(data);
-		});
-		worker.on("error", (error) => {
-			for (const id of [...waiting.keys()]) settle(id)?.reject(error);
-			worker = undefined;
-		});
-	}
-	const w = worker;
+	let slot = 0;
+	for (let i = 1; i < POOL; i++) if ((pending[i] ?? 0) < (pending[slot] ?? 0)) slot = i;
+	// Reject worker startup failures so smaller() can keep the original PNG.
 	return new Promise((resolve, reject) => {
-		waiting.set(nextId, { resolve, reject });
-		w.ref();
+		const w = workerAt(slot);
+		clearTimeout(idle[slot]);
+		waiting.set(nextId, { resolve, reject, slot });
+		if (pending[slot]++ === 0) w.ref();
 		w.postMessage({ id: nextId++, data, quality });
 	});
 }
 
+/** PNGs that could not be converted since pi started, for /session-slim status. */
+let imageFailures = 0;
+
 /** The WebP for a PNG, or undefined when it should stay as it is (tiny, unreadable, or no smaller as WebP). */
-async function smaller(png: string, quality: number): Promise<string | undefined> {
+async function smaller(png: string, quality: number, stats?: { imageErrors: number }): Promise<string | undefined> {
 	if (png.length < MIN_IMAGE) return undefined;
-	const webp = await toWebp(png, quality).catch(() => undefined);
+	const webp = await toWebp(png, quality).catch(() => {
+		imageFailures++;
+		if (stats) stats.imageErrors++;
+		return undefined;
+	});
 	return webp && webp.length < png.length ? webp : undefined;
 }
 
 /** A session line with its PNG images as WebP. Every other byte stays. */
-async function slimLine(line: string, quality: number): Promise<string> {
+async function slimLine(line: string, quality: number, stats?: { imageErrors: number }): Promise<string> {
 	const message = imageMessage(line);
 	if (!message) return line;
 	let changed = false;
 	for (const image of message.images) {
 		if (image.mimeType !== "image/png") continue;
-		const webp = await smaller(image.data, quality);
+		const webp = await smaller(image.data, quality, stats);
 		if (!webp) continue;
 		image.data = webp;
 		image.mimeType = "image/webp";
@@ -189,7 +220,7 @@ async function skeletonHash(file: string) {
  * Compress `file` to `file.zst` and leave a stub. With `quality` above 0, PNG images become WebP
  * of that quality first, which cannot be undone. Returns the bytes saved (0 when already archived).
  */
-export async function archive(file: string, quality = 0): Promise<number> {
+export async function archive(file: string, quality = 0, stats?: { imageErrors: number }): Promise<number> {
 	const zst = zstOf(file);
 	if (existsSync(zst)) return 0;
 	const before = statSync(file);
@@ -202,12 +233,24 @@ export async function archive(file: string, quality = 0): Promise<number> {
 			let changed = false;
 			await pipeline(
 				lines(file),
+				// Lines convert concurrently so every worker is busy, and are written in their order.
+				// The bytes held back are capped, so a slow image cannot pull the whole file into memory.
 				async function* (source) {
-					for await (const line of source) {
-						const slim = await slimLine(line, quality);
-						changed ||= slim !== line;
-						yield `${slim}\n`;
+					const queue: { line: string; slim: Promise<string> }[] = [];
+					let held = 0;
+					async function next() {
+						const { line, slim } = queue.shift()!;
+						held -= line.length;
+						const out = await slim;
+						changed ||= out !== line;
+						return `${out}\n`;
 					}
+					for await (const line of source) {
+						queue.push({ line, slim: slimLine(line, quality, stats) });
+						held += line.length;
+						while (held > QUEUE_BYTES) yield await next();
+					}
+					while (queue.length) yield await next();
 				},
 				createWriteStream(slimTmp, { mode: 0o600 }),
 			);
@@ -309,6 +352,8 @@ export interface RunResult {
 	files: number;
 	saved: number;
 	errors: string[];
+	/** PNGs left as they are because they could not be converted */
+	imageErrors: number;
 }
 
 /** Archive sessions under `roots` not modified for `days`, except `skip`. */
@@ -318,7 +363,7 @@ export async function archiveOld(
 	opts: { skip?: string; quality?: number; signal?: AbortSignal; onFile?: () => void } = {},
 ): Promise<RunResult> {
 	const cutoff = Date.now() - days * 86_400_000;
-	const result: RunResult = { files: 0, saved: 0, errors: [] };
+	const result: RunResult = { files: 0, saved: 0, errors: [], imageErrors: 0 };
 	for (const file of walk(roots)) {
 		if (opts.signal?.aborted) break;
 		try {
@@ -329,7 +374,7 @@ export async function archiveOld(
 			}
 			if (!file.endsWith(".jsonl") || file === opts.skip || st.size < MIN_SIZE || st.mtimeMs > cutoff) continue;
 			if (isArchived(file)) continue;
-			result.saved += await archive(file, opts.quality);
+			result.saved += await archive(file, opts.quality, result);
 			result.files++;
 			opts.onFile?.();
 		} catch (error) {
@@ -341,7 +386,7 @@ export async function archiveOld(
 
 /** Restore every archived session under `roots`. */
 export async function restoreAll(roots: string[]): Promise<RunResult> {
-	const result: RunResult = { files: 0, saved: 0, errors: [] };
+	const result: RunResult = { files: 0, saved: 0, errors: [], imageErrors: 0 };
 	for (const zst of walk(roots)) {
 		if (!zst.endsWith(".jsonl.zst")) continue;
 		try {
@@ -382,6 +427,14 @@ export default function sessionSlim(pi: ExtensionAPI) {
 	let abort: AbortController | undefined;
 	let timer: NodeJS.Timeout | undefined;
 	let reloaded: (() => void) | undefined;
+
+	const report = (ctx: ExtensionContext, verb: string, r: RunResult) =>
+		ctx.ui.notify(
+			`${verb} ${r.files} session(s)${r.saved ? `, saved ${mb(r.saved)}` : ""}` +
+				(r.imageErrors ? `\n${r.imageErrors} PNG image(s) could not be converted and were kept as PNG` : "") +
+				(r.errors.length ? `\n${r.errors.length} failed:\n${r.errors.slice(0, 5).join("\n")}` : ""),
+			r.errors.length || r.imageErrors ? "warning" : "info",
+		);
 
 	/** One run at a time across pi processes. The lock is touched per file; 10 quiet minutes means its owner died. */
 	async function run(ctx: Parameters<typeof roots>[0], days: number, skip?: string): Promise<RunResult | undefined> {
@@ -443,7 +496,12 @@ export default function sessionSlim(pi: ExtensionAPI) {
 		if (!(envDays > 0) || age(done) < 6 * 3_600_000) return;
 		// Wait until startup is over, and never keep pi alive for this.
 		timer = setTimeout(() => {
-			run(ctx, envDays, file).catch(() => {});
+			run(ctx, envDays, file)
+				.then((r) => {
+					// Say something only when there is something to say; a pass with no work stays quiet.
+					if (r && (r.files || r.errors.length || r.imageErrors)) report(ctx, "pi-session-slim: archived", r);
+				})
+				.catch(() => {}); // ctx is stale once the user switched sessions; the run itself is done
 		}, 5_000);
 		timer.unref();
 	});
@@ -477,29 +535,31 @@ export default function sessionSlim(pi: ExtensionAPI) {
 				}
 				return;
 			}
-			const report = (verb: string, r: RunResult) =>
-				ctx.ui.notify(
-					`${verb} ${r.files} session(s)${r.saved ? `, saved ${mb(r.saved)}` : ""}` +
-						(r.errors.length ? `\n${r.errors.length} failed:\n${r.errors.slice(0, 5).join("\n")}` : ""),
-					r.errors.length ? "warning" : "info",
-				);
 			if (sub === "run") {
 				const days = arg === undefined ? envDays || 7 : Number(arg);
 				if (!(days >= 0)) return ctx.ui.notify("Usage: /session-slim run [days]", "error");
 				const result = await run(ctx, days, current);
 				if (!result) return ctx.ui.notify("Another pi is archiving sessions right now.", "warning");
-				return report("Archived", result);
+				return report(ctx, "Archived", result);
 			}
-			if (sub === "restore") return report("Restored", await restoreAll(roots(ctx)));
+			if (sub === "restore") return report(ctx, "Restored", await restoreAll(roots(ctx)));
 			if (sub !== "status") return ctx.ui.notify("Usage: /session-slim [status | run [days] | restore]", "error");
 			let archived = 0;
 			let archivedBytes = 0;
 			let plain = 0;
 			let plainBytes = 0;
+			let orphans = 0;
+			let orphanBytes = 0;
 			for (const file of walk(roots(ctx))) {
 				if (file.endsWith(".jsonl.zst")) {
 					archived++;
 					archivedBytes += statSync(file).size;
+					// Left behind when the session was deleted in /resume. Never removed for you: the stub
+					// may have been deleted by mistake, and the archive is then the only copy.
+					if (!existsSync(file.slice(0, -4))) {
+						orphans++;
+						orphanBytes += statSync(file).size;
+					}
 				} else if (file.endsWith(".jsonl") && !isArchived(file)) {
 					plain++;
 					plainBytes += statSync(file).size;
@@ -508,8 +568,10 @@ export default function sessionSlim(pi: ExtensionAPI) {
 			ctx.ui.notify(
 				`Archived: ${archived} session(s), ${mb(archivedBytes)} on disk\n` +
 					`Not archived: ${plain} session(s), ${mb(plainBytes)}\n` +
+					(orphans ? `Archives without a session: ${orphans}, ${mb(orphanBytes)} (deleted in /resume; remove the .jsonl.zst yourself)\n` : "") +
 					(envDays > 0 ? `Sessions idle for ${envDays} day(s) are archived automatically.` : "Automatic archiving is off.") +
-					`\n${quality > 0 ? `PNG images become WebP (quality ${quality}).` : "Images are kept as they are."}`,
+					`\n${quality > 0 ? `PNG images become WebP (quality ${quality}).` : "Images are kept as they are."}` +
+					(imageFailures ? `\n${imageFailures} PNG image(s) could not be converted since pi started and were kept as PNG.` : ""),
 				"info",
 			);
 		},
