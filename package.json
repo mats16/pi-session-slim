@@ -6,11 +6,11 @@
   "exports": "./index.ts",
   "license": "MIT",
   "author": "mats16",
-  "homepage": "https://github.com/mats16/pi-session-zstd#readme",
-  "bugs": "https://github.com/mats16/pi-session-zstd/issues",
+  "homepage": "https://github.com/mats16/pi-session-slim#readme",
+  "bugs": "https://github.com/mats16/pi-session-slim/issues",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mats16/pi-session-zstd.git"
+    "url": "git+https://github.com/mats16/pi-session-slim.git"
   },
   "keywords": [
     "pi-package",

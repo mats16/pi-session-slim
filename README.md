@@ -12,7 +12,7 @@ It uses the zstd built into Node (`node:zlib`) and a WebAssembly build of libweb
 ## Install
 
 ```sh
-pi install git:github.com/mats16/pi-session-zstd
+pi install git:github.com/mats16/pi-session-slim
 ```
 
 Needs Node 22.19 or later.
