@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { appendFileSync, chmodSync, existsSync, mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -129,6 +129,70 @@ test("archive with a quality turns PNG into WebP and changes nothing else", asyn
 	await restore(file);
 	// One copy of each line, the PNG now WebP: the leftover PNG lines were not appended as new ones.
 	assert.equal(readFileSync(file, "utf8"), [head, pad, image(webp, "image/webp"), tiny, end].join("\n") + "\n");
+});
+
+test("archiveOld counts PNGs it cannot convert, keeps them, and keeps line order while converting in parallel", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "psz-"));
+	const file = join(dir, "images.jsonl");
+	const image = (id: string, data: string, mimeType: string) =>
+		line({ type: "message", id, parentId: "a1", message: { role: "toolResult", content: [{ type: "image", data, mimeType }] } });
+	const data = png();
+	const webp = await toWebp(data, 80);
+	const broken = image("bad", "iVBORw0KGgo" + "A".repeat(5000), "image/png"); // a PNG signature, then garbage
+	const head = line({ type: "session", version: 3, id: "abc", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/tmp" });
+	const pad = msg("a1", null, "user", "x".repeat(70_000));
+	const ids = Array.from({ length: 12 }, (_, i) => `i${i}`);
+	const before = [head, pad, ...ids.map((id) => image(id, data, "image/png")), broken, msg("z", "bad", "assistant", "end")];
+	const after = [head, pad, ...ids.map((id) => image(id, webp, "image/webp")), broken, msg("z", "bad", "assistant", "end")];
+	writeFileSync(file, before.join("\n") + "\n");
+	const old = new Date(Date.now() - 30 * 86_400_000);
+	utimesSync(file, old, old);
+
+	const result = await archiveOld([dir], 7, { quality: 80 });
+	assert.deepEqual([result.files, result.errors, result.imageErrors], [1, [], 1]);
+	await restore(file);
+	assert.equal(readFileSync(file, "utf8"), after.join("\n") + "\n");
+});
+
+test("status reports missing stubs and offers recovery without assuming deletion", async () => {
+	const saved = process.env.PI_CODING_AGENT_DIR;
+	try {
+		const { dir, file, text } = session();
+		process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "slim-status-"));
+		await archive(file);
+		rmSync(file); // what deleting it in /resume does
+		let handler: any;
+		const notices: string[] = [];
+		sessionSlim({ on() {}, registerCommand(_name: string, command: any) { handler = command.handler; } } as any);
+		await handler("status", { sessionManager: { getSessionFile() {}, getSessionDir() { return dir; } }, ui: { notify(text: string) { notices.push(text); } } });
+		assert.match(notices[0], /Archives without a stub: 1,/);
+		assert.match(notices[0], /recover with \/session-slim restore/);
+		assert.doesNotMatch(notices[0], /deleted in \/resume|remove the/);
+		assert.ok(existsSync(zstOf(file))); // reported, not removed
+		await handler("restore", { sessionManager: { getSessionFile() {}, getSessionDir() { return dir; } }, ui: { notify(text: string) { notices.push(text); } } });
+		assert.equal(readFileSync(file, "utf8"), text);
+		assert.ok(!existsSync(zstOf(file)));
+	} finally {
+		if (saved === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = saved;
+	}
+});
+
+test("archive preserves mixed-size entries across queue compaction and backpressure", async () => {
+	const { dir, file, body } = session();
+	try {
+		const entries = Array.from({ length: 120_000 }, (_, i) =>
+			line({ type: "message", id: String(i), message: { role: "user", content: `entry ${i}` } }),
+		);
+		for (let i = 100; i < entries.length; i += 20_000) entries[i] = msg(`large-${i}`, null, "user", "x".repeat(2_000_000));
+		const text = body[0] + "\n" + entries.join("\n") + "\n";
+		writeFileSync(file, text);
+		await archive(file, 80);
+		await restore(file);
+		assert.equal(readFileSync(file, "utf8"), text);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("conversion output errors reject without crashing pi or replacing the original", {
